@@ -116,12 +116,10 @@ export type TmpZoomKey = {
 }
 
 export type requestZoomAuthorizationUrlParam = {
-    enterpriseId : string, // the uuid of the enterprose
     expirationLimitHour? : number // the limited expiration hour of the created key for authorization
 }
 
 export const requestZoomAuthorizationUrl = functions.https.onCall( async ({
-    enterpriseId,
     expirationLimitHour = 1 // initialized by 1 hour
 } : requestZoomAuthorizationUrlParam ,context: functions.https.CallableContext) => {
     // check the access is authorised
@@ -130,6 +128,8 @@ export const requestZoomAuthorizationUrl = functions.https.onCall( async ({
         return
     }
     const { uid } = auth
+    const { token } = auth
+    const { enterpriseId } = token
 
     // create the temporarily key document
     const accessTokenRef = db.collection(`temporalKeys`).doc('zoom').collection('keys').doc()
@@ -145,60 +145,133 @@ export const requestZoomAuthorizationUrl = functions.https.onCall( async ({
     }
     await accessTokenRef.set(keyInfo)
 
-    // return the redirect url to authorize zoom with key  
-    const accessTokenUrl = 'https://zoom.us/oauth/authorize?response_type=code&client_id=7t2eCeBwQySq2hjb0m9pKw&redirect_uri=https%3A%2F%2F41e92f8c1ecd.ngrok.io%2Finitialize_zoom_access_token'
-    const zoomAuthorizePath = `${accessTokenUrl}&state=${accessTokenRef.id}`
-    // const zoomAuthorizePath = `${accessTokenUrl}`
+    const defaultZoomAppSnap = await db.collection('externalConfigs').doc('defaultZoomApp').get()
+    const defaultZoomAppDate = defaultZoomAppSnap.data()
+    if(!defaultZoomAppDate){
+        return 
+    }
+
+    const {appName} = defaultZoomAppDate
+    const zoomAppSnap = await db.collection('externalConnections').doc('zoom').collection('apps').doc(appName).get()
+    const zoomAppData = zoomAppSnap.data()
+    if(!zoomAppData){
+        return 
+    }
+    
+    const {installUrl} = zoomAppData
+    console.log("[log]zoom app info:", installUrl)
+
+    const zoomAuthorizePath = `${installUrl}&state=${accessTokenRef.id}`
     return zoomAuthorizePath
 });
 
 
+
 /*
-* refleshZoomAccessToken
+* initializeZoomAccessToken
 This function is called by https request.
 After called, this server gets the current access token information especially the refresh token.
 Then it sends the post request to Zoom api server to get new access token and save it to firestore
 */
-export const refleshZoomAccessToken = functions.https.onRequest( async (req, res) => {
-    const snapshot = await db.collection('enterprises').get()
-    if (!snapshot) {
+export const initializeZoomAccessToken = functions.https.onRequest( async (req, res) => {
+    const { code } = req.query
+    const { state } = req.query
+
+    if (!state || !code) {
+        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=invalidAccessToken`)
         return
     }
 
-    // すべてのconversationを保存する
-    const enterpriseList = await Promise.all(snapshot.docs.map( async (doc) => { 
-        return { id:doc.id, data: doc.data()}
-    }))
+    console.log("[log]state", state, "code", code)
+    const tmpKeyRef = db.collection('temporalKeys').doc('zoom').collection('keys').doc(String(state))
+    const tmpKeySnap = await tmpKeyRef.get()
+    const tmpKeyData = await tmpKeySnap.data()
 
-    console.log('[enterpriseList]', enterpriseList)
-
-    for (const i in enterpriseList){
-        const enterpriseId = enterpriseList[i].id
-
-        const accessTokenRef = db.collection('enterprises').doc(enterpriseId).collection('accessTokens').doc('zoom')
-        const accessTokenSnap = await accessTokenRef.get()
-        const accessTokenData = await accessTokenSnap.data()
-    
-        if(!accessTokenData){
-            continue
-        }    
-    
-        const refleshUrl = `https://zoom.us/oauth/token?grant_type=refresh_token&refresh_token=${accessTokenData.refreshToken}`
-        await axios.post(refleshUrl,{},{
-            headers: {Authorization:'Basic aFlqNWNRUjdSSkdVRjZkZF80RmlnOkRHYW1SbkdVcHZoWURJTGdPN05ZeDJqOFlZMTBqQ1A1'}
-        }).then( async (response) => {
-            const updatedDate = new Date()
-            await accessTokenRef.set({
-                accessToken : response.data.access_token,
-                refreshToken : response.data.refresh_token,
-                updatedDate : updatedDate
-            },{merge: true})
-            console.log('[log]response',response.data)
-        }).catch((error) => {
-            console.log('[log]error',error)
-        })
+    // アクセスkeyがない場合
+    if(!tmpKeyData){
+        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=invalidAccessToken`)
+        return
     }
-    res.status(200).send(`access_token updated`); 
+
+    const { enterpriseId, expiredDate, userId } = tmpKeyData
+    console.log("[log]tmpKey info", expiredDate, expiredDate.toDate() , "enterpriseId", enterpriseId, "userId",userId)
+
+
+    const defaultZoomAppSnap = await db.collection('externalConfigs').doc('defaultZoomApp').get()
+    const defaultZoomAppDate = defaultZoomAppSnap.data()
+    if(!defaultZoomAppDate){
+        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=internalError`)
+        return
+    }
+
+    const {appName} = defaultZoomAppDate
+    const zoomAppSnap = await db.collection('externalConnections').doc('zoom').collection('apps').doc(appName).get()
+    const zoomAppData = zoomAppSnap.data()
+    if(!zoomAppData){
+        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=internalError`)
+        return
+    }
+    
+    const {clientId, clientSecret} = zoomAppData
+    console.log("[log]zoom app info", clientId, clientSecret)
+
+    // keyの有効性チェック
+    if(new Date > expiredDate.toDate()) {
+        console.log('[log] invalidAccessToken : expired ',new Date > expiredDate.toDate())
+        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=invalidAccessToken`)
+        return
+    }    
+
+
+
+    // リクエストヘッダーの生成
+    const authorizationCode = `${clientId}:${clientSecret}`
+    const buff = Buffer.from(authorizationCode)
+    const base64data = buff.toString('base64')
+    console.log('[log]base64data', base64data)
+
+
+    // アクセストークンのリクエスト
+    const accessTokenUrl = `https://zoom.us/oauth/token?grant_type=authorization_code&code=${code}&redirect_uri=https://us-central1-react-tutorial-tailwind.cloudfunctions.net/initializeZoomAccessToken`
+    await axios.post(accessTokenUrl,{},{
+        headers: {
+            'Authorization' :`Basic ${base64data}`,
+        }
+    }).then( async (response)=>{
+        const { data } = response
+        const {access_token, token_type, refresh_token, expires_in, scope} = data
+        const accessTokenRef = db.collection('enterprises').doc(enterpriseId).collection('accessTokens').doc('zoom')
+        
+        // アクセストークンが取得できなかった場合
+        if(!access_token){
+            res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=internalError`)
+            return
+        }
+
+        const createdDate = new Date()
+        await accessTokenRef.set({
+            accessToken : access_token,
+            refreshToken : refresh_token,
+            tokenType : token_type,
+            expiresIn : expires_in,
+            scope : scope,
+            createdDate : createdDate,
+            updatedDate : createdDate,
+        },{merge: true})
+
+        const userRef = db.collection('enterprises').doc(enterpriseId).collection('users').doc(userId)
+        await userRef.set({
+            authorizeZoom : true
+        },{merge:true})
+
+    }).catch((err)=>{
+        console.log('[log]post request error :',err)
+        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=internalError`)  
+        return
+    })
+
+    res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=success`)
+    return  
 })
 
 
@@ -249,6 +322,81 @@ export const scheduledRefleshZoomAccessToken = functions.pubsub.schedule('every 
     }
     return 
 })
+
+/*
+* refleshZoomAccessToken
+This function is called by https request.
+After called, this server gets the current access token information especially the refresh token.
+Then it sends the post request to Zoom api server to get new access token and save it to firestore
+*/
+export const refleshZoomAccessToken = functions.https.onRequest( async (req, res) => {
+    const snapshot = await db.collection('enterprises').get()
+    if (!snapshot) {
+        return
+    }
+
+    // すべてのconversationを保存する
+    const enterpriseList = await Promise.all(snapshot.docs.map( async (doc) => { 
+        return { id:doc.id, data: doc.data()}
+    }))
+
+    console.log('[enterpriseList]', enterpriseList)
+
+    for (const i in enterpriseList){
+        const enterpriseId = enterpriseList[i].id
+
+        const accessTokenRef = db.collection('enterprises').doc(enterpriseId).collection('accessTokens').doc('zoom')
+        const accessTokenSnap = await accessTokenRef.get()
+        const accessTokenData = await accessTokenSnap.data()
+    
+        if(!accessTokenData){
+            continue
+        }    
+    
+        const refleshUrl = `https://zoom.us/oauth/token?grant_type=refresh_token&refresh_token=${accessTokenData.refreshToken}`
+        await axios.post(refleshUrl,{},{
+            headers: {Authorization:'Basic aFlqNWNRUjdSSkdVRjZkZF80RmlnOkRHYW1SbkdVcHZoWURJTGdPN05ZeDJqOFlZMTBqQ1A1'}
+        }).then( async (response) => {
+            const updatedDate = new Date()
+            await accessTokenRef.set({
+                accessToken : response.data.access_token,
+                refreshToken : response.data.refresh_token,
+                updatedDate : updatedDate
+            },{merge: true})
+            console.log('[log]response',response.data)
+        }).catch((error) => {
+            console.log('[log]error',error)
+        })
+    }
+    res.status(200).send(`access_token updated`); 
+})
+
+/*
+* zoomRecordingHandler
+This function is called by https request.
+After called, this server gets the current access token information especially the refresh token.
+Then it sends the post request to Zoom api server to get new access token and save it to firestore
+*/
+export const zoomRecordingHandler = functions.https.onRequest( async (req, res) => {
+
+    console.log("recieve request");
+
+    return
+})
+
+/*
+* zoomMeetingHandler
+This function is called by https request.
+After called, this server gets the current access token information especially the refresh token.
+Then it sends the post request to Zoom api server to get new access token and save it to firestore
+*/
+export const zoomMeetingHandler = functions.https.onRequest( async (req, res) => {
+
+    console.log("recieve request");
+
+    return
+})
+
 
 
 /*
@@ -363,12 +511,24 @@ export const getReservedZoomMeeting = functions.https.onCall( async ({}, context
     for( const i in meetings ){
         const meeting = meetings[i]
         const {id} = meeting
+        const {start_time} = meeting
+        const {created_at} = meeting
+        const {timezone} = meeting
+        console.log('[log]start_time at default',start_time,Moment(start_time))
+        console.log('[log]start_time at Asia/Tokyo',start_time,Moment(start_time).tz("Asia/Tokyo"))
+        console.log('[log]created_at ',created_at)
+        // console.log('[log]time ',created_at,Moment(created_at, timezone))
         // const reservedMeetingsRef = db.collection('enterprises').doc(enterpriseId).collection('users').doc(uid)
         const reservedMeetingsRef = db.collection('enterprises').doc(enterpriseId).collection('users').doc(uid).collection('reservedMeetings').doc(String(id))
-        await reservedMeetingsRef.set({
+        let payload = {
             'type': 'video',
             'app': 'zoom',
-        ...meeting},{merge: true})
+            ...meeting
+        }
+        payload['start_time'] = Moment(start_time).tz(timezone)
+        payload['created_at'] = Moment(created_at).tz(timezone)
+        
+        await reservedMeetingsRef.set(payload,{merge: true})
     }
 
     return status
