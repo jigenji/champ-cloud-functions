@@ -3,10 +3,12 @@ import * as firebase from 'firebase-admin'
 import admin = require('firebase-admin')
 import axios from "axios"
 import * as Moment from 'moment-timezone';
-
+import * as camelcaseKeys from 'camelcase-keys'
+const {PubSub} = require('@google-cloud/pubsub')
 
 firebase.initializeApp()
 const db = firebase.firestore()
+const pubsub = new PubSub()
 
 /*
 * checkInviteKey
@@ -166,6 +168,30 @@ export const requestZoomAuthorizationUrl = functions.https.onCall( async ({
 });
 
 
+async function getBase64Code() {
+    const defaultZoomAppSnap = await db.collection('externalConfigs').doc('defaultZoomApp').get()
+    const defaultZoomAppDate = defaultZoomAppSnap.data()
+    if(!defaultZoomAppDate){
+        return
+    }
+
+    const {appName} = defaultZoomAppDate
+    const zoomAppSnap = await db.collection('externalConnections').doc('zoom').collection('apps').doc(appName).get()
+    const zoomAppData = zoomAppSnap.data()
+    if(!zoomAppData){
+        return
+    }
+    
+    const {clientId, clientSecret} = zoomAppData
+    console.log("[log]zoom app info", clientId, clientSecret)
+        // リクエストヘッダーの生成
+    const authorizationCode = `${clientId}:${clientSecret}`
+    const buff = Buffer.from(authorizationCode)
+    const base64data = buff.toString('base64')
+
+    return base64data
+}
+
 
 /*
 * initializeZoomAccessToken
@@ -196,6 +222,12 @@ export const initializeZoomAccessToken = functions.https.onRequest( async (req, 
     const { enterpriseId, expiredDate, userId } = tmpKeyData
     console.log("[log]tmpKey info", expiredDate, expiredDate.toDate() , "enterpriseId", enterpriseId, "userId",userId)
 
+    // keyの有効性チェック
+    if(new Date > expiredDate.toDate()) {
+        console.log('[log] invalidAccessToken : expired ',new Date > expiredDate.toDate())
+        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=invalidAccessToken`)
+        return
+    }    
 
     const defaultZoomAppSnap = await db.collection('externalConfigs').doc('defaultZoomApp').get()
     const defaultZoomAppDate = defaultZoomAppSnap.data()
@@ -214,14 +246,6 @@ export const initializeZoomAccessToken = functions.https.onRequest( async (req, 
     
     const {clientId, clientSecret} = zoomAppData
     console.log("[log]zoom app info", clientId, clientSecret)
-
-    // keyの有効性チェック
-    if(new Date > expiredDate.toDate()) {
-        console.log('[log] invalidAccessToken : expired ',new Date > expiredDate.toDate())
-        res.status(302).redirect(`https://c7dbd2fa769d.ngrok.io?authorizeZoom=invalidAccessToken`)
-        return
-    }    
-
 
 
     // リクエストヘッダーの生成
@@ -303,11 +327,18 @@ export const scheduledRefleshZoomAccessToken = functions.pubsub.schedule('every 
     
         if(!accessTokenData){
             continue
-        }    
+        }
+        
+        const base64data = await getBase64Code()
+        console.log('[log]base64data', base64data)
+
+        if(!base64data){
+            continue
+        }
     
         const refleshUrl = `https://zoom.us/oauth/token?grant_type=refresh_token&refresh_token=${accessTokenData.refreshToken}`
         await axios.post(refleshUrl,{},{
-            headers: {Authorization:'Basic aFlqNWNRUjdSSkdVRjZkZF80RmlnOkRHYW1SbkdVcHZoWURJTGdPN05ZeDJqOFlZMTBqQ1A1'}
+            headers: {Authorization :`Basic ${base64data}`}
         }).then( async (response) => {
             const updatedDate = new Date()
             await accessTokenRef.set({
@@ -332,7 +363,7 @@ Then it sends the post request to Zoom api server to get new access token and sa
 export const refleshZoomAccessToken = functions.https.onRequest( async (req, res) => {
     const snapshot = await db.collection('enterprises').get()
     if (!snapshot) {
-        return
+        res.status(200).send(`fail to update access_token`)
     }
 
     // すべてのconversationを保存する
@@ -352,10 +383,17 @@ export const refleshZoomAccessToken = functions.https.onRequest( async (req, res
         if(!accessTokenData){
             continue
         }    
+
+        const base64data = await getBase64Code()
+        console.log('[log]base64data', base64data)
+
+        if(!base64data){
+            continue
+        }
     
         const refleshUrl = `https://zoom.us/oauth/token?grant_type=refresh_token&refresh_token=${accessTokenData.refreshToken}`
         await axios.post(refleshUrl,{},{
-            headers: {Authorization:'Basic aFlqNWNRUjdSSkdVRjZkZF80RmlnOkRHYW1SbkdVcHZoWURJTGdPN05ZeDJqOFlZMTBqQ1A1'}
+            headers: {Authorization :`Basic ${base64data}`}
         }).then( async (response) => {
             const updatedDate = new Date()
             await accessTokenRef.set({
@@ -369,6 +407,7 @@ export const refleshZoomAccessToken = functions.https.onRequest( async (req, res
         })
     }
     res.status(200).send(`access_token updated`); 
+    return
 })
 
 /*
@@ -378,10 +417,28 @@ After called, this server gets the current access token information especially t
 Then it sends the post request to Zoom api server to get new access token and save it to firestore
 */
 export const zoomRecordingHandler = functions.https.onRequest( async (req, res) => {
+    console.log("[log]req.body.payload:",req.body.payload.object);
 
-    console.log("recieve request");
+    const {host_email} = req.body.payload.object
+    console.log('[log]host_email',host_email)
 
-    return
+
+    if(!host_email){
+        res.sendStatus(200)
+    }
+
+    const dataBuffer = Buffer.from(JSON.stringify({
+        userEmail: host_email,
+        taskType: 'getExistedRecordings'
+    }))
+
+    const messageId = await pubsub.topic('connect-zoom').publish(dataBuffer).catch((err: any) => {
+    console.error(err.message, err)
+    })
+    console.log(`Message ${messageId} published.`)
+
+    res.sendStatus(200)
+
 })
 
 /*
@@ -392,7 +449,22 @@ Then it sends the post request to Zoom api server to get new access token and sa
 */
 export const zoomMeetingHandler = functions.https.onRequest( async (req, res) => {
 
-    console.log("recieve request");
+    console.log("recieve request", req)
+    console.log("[log]req.body:",req.body)
+
+    const {host_email} = req.body
+
+    console.log('[log]host_email',host_email)
+
+    // const dataBuffer = Buffer.from(JSON.stringify({
+    //     userEmail: host_email,
+    //     taskType: 'getExistedRecordings'
+    // }))
+
+    // const messageId = await pubSub.topic('create-features').publish(dataBuffer).catch((err: any) => {
+    // console.error(err.message, err)
+    // })
+    // console.log(`Message ${messageId} published.`)
 
     return
 })
@@ -495,7 +567,7 @@ export const getReservedZoomMeeting = functions.https.onCall( async ({}, context
     const accessTokenData = await accessTokenSnap.data()
 
     if(!accessTokenData){
-        return 404
+        return
     }    
     const {accessToken} = accessTokenData
     const creatMeetingUrl = `https://api.zoom.us/v2/users/${email}/meetings`
@@ -505,31 +577,33 @@ export const getReservedZoomMeeting = functions.https.onCall( async ({}, context
         }
     })
     const {data} = response
-    const {status} = response
     const {meetings} = data
 
     for( const i in meetings ){
         const meeting = meetings[i]
+        const camelcaseMeeting = camelcaseKeys(meeting)
+        console.log('[log]camelcase Meeting:',camelcaseMeeting)
         const {id} = meeting
-        const {start_time} = meeting
-        const {created_at} = meeting
-        const {timezone} = meeting
-        console.log('[log]start_time at default',start_time,Moment(start_time))
-        console.log('[log]start_time at Asia/Tokyo',start_time,Moment(start_time).tz("Asia/Tokyo"))
-        console.log('[log]created_at ',created_at)
+        const {startTime} = camelcaseMeeting
+        const {createdAt} = camelcaseMeeting
+        // const {timezone} = meeting
+        console.log('[log]start_time at default',startTime,Moment(startTime))
+        console.log('[log]start_time at Asia/Tokyo',startTime,Moment(startTime).tz("Asia/Tokyo"))
+        console.log('[log]created_at ',createdAt)
         // console.log('[log]time ',created_at,Moment(created_at, timezone))
         // const reservedMeetingsRef = db.collection('enterprises').doc(enterpriseId).collection('users').doc(uid)
         const reservedMeetingsRef = db.collection('enterprises').doc(enterpriseId).collection('users').doc(uid).collection('reservedMeetings').doc(String(id))
-        let payload = {
+        const payload = {
             'type': 'video',
             'app': 'zoom',
             ...meeting
         }
-        payload['start_time'] = Moment(start_time).tz(timezone)
-        payload['created_at'] = Moment(created_at).tz(timezone)
+        
+        payload['start_time'] = Moment(startTime)
+        payload['created_at'] = Moment(createdAt)
         
         await reservedMeetingsRef.set(payload,{merge: true})
     }
 
-    return status
+    return
 })
